@@ -1363,6 +1363,8 @@ class FeishuAdapter(BasePlatformAdapter):
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
+        # Plugin approval button state (action_id → {kind, payload, message_id, chat_id})
+        self._plugin_approval_state: Dict[str, Dict[str, Any]] = {}
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
@@ -1811,6 +1813,178 @@ class FeishuAdapter(BasePlatformAdapter):
                 },
             ],
         }
+
+    async def send_plugin_approval_card(
+        self,
+        chat_id: str,
+        kind: str,
+        payload: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render and send a plugin-defined approval card.
+
+        Looks up *kind* in ``gateway.approval_kinds`` registry, calls its
+        ``render_card(payload)`` to produce a Feishu card, and stores the
+        action_id → kind/payload mapping so that ``_handle_plugin_approval_card_action``
+        can route the eventual button click back to the plugin's ``on_action``.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        from gateway.approval_kinds import get_approval_kind
+
+        approval_kind = get_approval_kind(kind)
+        if approval_kind is None:
+            return SendResult(success=False, error=f"unknown approval kind: {kind}")
+
+        try:
+            action_id = uuid.uuid4().hex
+            card = approval_kind.render_card(dict(payload))
+            if not isinstance(card, dict):
+                return SendResult(
+                    success=False,
+                    error=f"render_card for {kind!r} must return a dict, got {type(card).__name__}",
+                )
+            self._inject_kind_into_actions(card, kind=kind, action_id=action_id)
+
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=json.dumps(card, ensure_ascii=False),
+                reply_to=None,
+                metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "send_plugin_approval_card failed")
+            if result.success:
+                self._plugin_approval_state[action_id] = {
+                    "kind": kind,
+                    "payload": dict(payload),
+                    "message_id": result.message_id or "",
+                    "chat_id": chat_id,
+                }
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] send_plugin_approval_card(%s) failed: %s", kind, exc)
+            return SendResult(success=False, error=str(exc))
+
+    @staticmethod
+    def _inject_kind_into_actions(card: Dict[str, Any], *, kind: str, action_id: str) -> None:
+        """Walk a card dict and tag every button's ``value`` with hermes_kind/action_id.
+
+        Plugins author the visual layout; the adapter owns routing identity so
+        a malicious or buggy plugin cannot send a card whose buttons fail to
+        round-trip back to its own ``on_action``.
+        """
+        def _walk(node: Any) -> None:
+            if isinstance(node, dict):
+                if node.get("tag") == "button":
+                    value = node.get("value")
+                    if not isinstance(value, dict):
+                        value = {}
+                    value["hermes_kind"] = kind
+                    value["hermes_action_id"] = action_id
+                    node["value"] = value
+                for v in node.values():
+                    _walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    _walk(v)
+
+        _walk(card)
+
+    def _handle_plugin_approval_card_action(
+        self, *, event: Any, action_value: Dict[str, Any], loop: Any
+    ) -> Any:
+        """Route a plugin-kind card click to the registered on_action handler."""
+        kind = str(action_value.get("hermes_kind") or "")
+        action_id = str(action_value.get("hermes_action_id") or "")
+        if not kind or not action_id:
+            logger.debug("[Feishu] Plugin card action missing kind/action_id, ignoring")
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        from gateway.approval_kinds import get_approval_kind
+
+        approval_kind = get_approval_kind(kind)
+        if approval_kind is None:
+            logger.warning("[Feishu] No handler registered for approval kind %r", kind)
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        state = self._plugin_approval_state.pop(action_id, None)
+        if state is None:
+            logger.debug("[Feishu] Plugin approval %s already resolved or unknown", action_id)
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        operator = getattr(event, "operator", None)
+        open_id = str(getattr(operator, "open_id", "") or "")
+        user_name = self._get_cached_sender_name(open_id) or open_id
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._dispatch_plugin_approval(
+                approval_kind=approval_kind,
+                action_id=action_id,
+                action_value=dict(action_value),
+                state=state,
+                operator_open_id=open_id,
+                operator_name=user_name,
+            ),
+            loop,
+        )
+
+        if P2CardActionTriggerResponse is None:
+            return None
+        response = P2CardActionTriggerResponse()
+        # Wait briefly for the handler to produce a resolved card to return inline;
+        # if it takes longer than a couple seconds we fall back to the original card
+        # and let the handler PATCH the message asynchronously via its own logic.
+        try:
+            resolved = future.result(timeout=2.5)
+        except Exception:
+            resolved = None
+        if resolved and CallBackCard is not None:
+            cb = CallBackCard()
+            cb.type = "raw"
+            cb.data = resolved
+            response.card = cb
+        return response
+
+    async def _dispatch_plugin_approval(
+        self,
+        *,
+        approval_kind: Any,
+        action_id: str,
+        action_value: Dict[str, Any],
+        state: Dict[str, Any],
+        operator_open_id: str,
+        operator_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Run the plugin's on_action and surface its log/resolved-card result."""
+        from gateway.approval_kinds import ApprovalContext
+
+        ctx = ApprovalContext(
+            kind=approval_kind.kind,
+            action_id=action_id,
+            action_value=action_value,
+            payload=dict(state.get("payload") or {}),
+            operator_open_id=operator_open_id,
+            operator_name=operator_name,
+            chat_id=str(state.get("chat_id") or ""),
+        )
+        try:
+            result = await approval_kind.on_action(ctx)
+        except Exception as exc:
+            logger.error(
+                "Approval kind %r on_action raised: %s",
+                approval_kind.kind, exc, exc_info=True,
+            )
+            return None
+        if result is None:
+            return None
+        if result.log_message:
+            logger.info(
+                "[Feishu] Plugin approval %s/%s resolved by %s: %s",
+                approval_kind.kind, action_id, operator_name, result.log_message,
+            )
+        return result.resolved_card
 
     async def send_voice(
         self,
@@ -2311,7 +2485,10 @@ class FeishuAdapter(BasePlatformAdapter):
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
+        hermes_kind = action_value.get("hermes_kind") if isinstance(action_value, dict) else None
 
+        if hermes_kind:
+            return self._handle_plugin_approval_card_action(event=event, action_value=action_value, loop=loop)
         if hermes_action:
             return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
 

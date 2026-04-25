@@ -340,6 +340,73 @@ class PluginContext:
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
+    # -- approval card registration ------------------------------------------
+
+    def register_approval_kind(
+        self,
+        kind: str,
+        render_card: Callable[[dict], dict],
+        on_action: Callable[[Any], Any],
+        description: str = "",
+    ) -> None:
+        """Register a plugin-defined approval card kind.
+
+        Plugins use this to ship confirmation/approval cards (with custom
+        button layouts and click handlers) without forking platform adapters.
+        See ``gateway.approval_kinds`` for the contract; the handler is an
+        async callable returning ``ApprovalResult``.
+
+        ``kind`` is auto-namespaced with the plugin name when it doesn't
+        contain a dot, so a plugin called ``dmc-ads`` registering ``adTag.del``
+        ends up as ``dmc-ads.adTag.del``.
+        """
+        from gateway.approval_kinds import register_approval_kind
+
+        namespaced_kind = kind if "." in kind else f"{self.manifest.name}.{kind}"
+        register_approval_kind(
+            kind=namespaced_kind,
+            render_card=render_card,
+            on_action=on_action,
+            description=description,
+        )
+        logger.debug(
+            "Plugin %s registered approval kind: %s",
+            self.manifest.name, namespaced_kind,
+        )
+
+    async def send_approval_card(
+        self,
+        platform: str,
+        chat_id: str,
+        kind: str,
+        payload: dict,
+    ) -> Any:
+        """Send a previously-registered approval card to a chat on *platform*.
+
+        Currently supported platform: ``"feishu"``. Returns the adapter's
+        SendResult (``.success``, ``.message_id``, ``.error``). The ``kind``
+        must already be registered via ``register_approval_kind``; if you
+        relied on auto-namespacing there, prepend the plugin name here too.
+        """
+        if platform.lower() != "feishu":
+            raise NotImplementedError(
+                f"send_approval_card not yet implemented for platform={platform!r}"
+            )
+
+        adapter = None
+        gateway = getattr(self._manager, "_gateway_ref", None)
+        if gateway is not None:
+            for ad in getattr(gateway, "adapters", []) or []:
+                if getattr(ad, "platform_name", "").lower() == "feishu":
+                    adapter = ad
+                    break
+        if adapter is None:
+            raise RuntimeError("No Feishu adapter available in current gateway")
+
+        return await adapter.send_plugin_approval_card(
+            chat_id=chat_id, kind=kind, payload=payload,
+        )
+
     # -- tool dispatch -------------------------------------------------------
 
     def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
