@@ -56,7 +56,7 @@ _EXTRA_ENV_KEYS = frozenset({
     "WHATSAPP_MODE", "WHATSAPP_ENABLED",
     "MATTERMOST_HOME_CHANNEL", "MATTERMOST_REPLY_MODE",
     "MATRIX_PASSWORD", "MATRIX_ENCRYPTION", "MATRIX_DEVICE_ID", "MATRIX_HOME_ROOM",
-    "MATRIX_REQUIRE_MENTION", "MATRIX_FREE_RESPONSE_ROOMS", "MATRIX_AUTO_THREAD",
+    "MATRIX_REQUIRE_MENTION", "MATRIX_FREE_RESPONSE_ROOMS", "MATRIX_AUTO_THREAD", "MATRIX_DM_AUTO_THREAD",
     "MATRIX_RECOVERY_KEY",
 })
 import yaml
@@ -389,6 +389,20 @@ DEFAULT_CONFIG = {
         # (60+ tool iterations with tiny output) before users assume the
         # bot is dead and /restart.
         "gateway_notify_interval": 180,
+        # How user-attached images are presented to the main model on each turn.
+        #   "auto"   — attach natively when the active model reports
+        #              supports_vision=True AND the user hasn't explicitly
+        #              configured auxiliary.vision.provider.  Otherwise fall
+        #              back to text (vision_analyze pre-analysis).
+        #   "native" — always attach natively; non-vision models will either
+        #              error at the provider or get a last-chance text fallback
+        #              (see run_agent._prepare_messages_for_api).
+        #   "text"   — always pre-analyze with vision_analyze and prepend the
+        #              description as text; the main model never sees pixels.
+        # Affects gateway platforms, the TUI, and CLI /attach.  vision_analyze
+        # remains available as a tool regardless of this setting — the routing
+        # only controls how inbound user images are presented.
+        "image_input_mode": "auto",
     },
     
     "terminal": {
@@ -465,6 +479,7 @@ DEFAULT_CONFIG = {
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
         "allow_private_urls": False,  # Allow navigating to private/internal IPs (localhost, 192.168.x.x, etc.)
+        "auto_local_for_private_urls": True,  # When a cloud provider is set, auto-spawn local Chromium for LAN/localhost URLs instead of sending them to the cloud
         "cdp_url": "",  # Optional persistent CDP endpoint for attaching to an existing Chromium/Chrome
         # CDP supervisor — dialog + frame detection via a persistent WebSocket.
         # Active only when a CDP-capable backend is attached (Browserbase or
@@ -486,6 +501,19 @@ DEFAULT_CONFIG = {
     "checkpoints": {
         "enabled": True,
         "max_snapshots": 50,  # Max checkpoints to keep per directory
+        # Auto-maintenance: shadow repos accumulate forever under
+        # ~/.hermes/checkpoints/ (one per cd'd working directory). Field
+        # reports put the typical offender at 1000+ repos / ~12 GB. When
+        # auto_prune is on, hermes sweeps at startup (at most once per
+        # min_interval_hours) and deletes:
+        #   * orphan repos: HERMES_WORKDIR no longer exists on disk
+        #   * stale repos:  newest mtime older than retention_days
+        # Opt-in so users who rely on /rollback against long-ago sessions
+        # never lose data silently.
+        "auto_prune": False,
+        "retention_days": 7,
+        "delete_orphans": True,
+        "min_interval_hours": 24,
     },
 
     # Maximum characters returned by a single read_file call.  Reads that
@@ -626,7 +654,7 @@ DEFAULT_CONFIG = {
         "compact": False,
         "personality": "kawaii",
         "resume_display": "full",
-        "busy_input_mode": "interrupt",
+        "busy_input_mode": "interrupt",  # interrupt | queue | steer
         "bell_on_complete": False,
         "show_reasoning": False,
         "streaming": False,
@@ -914,7 +942,7 @@ DEFAULT_CONFIG = {
     # Pre-exec security scanning via tirith
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
-        "redact_secrets": True,
+        "redact_secrets": False,
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,
@@ -959,6 +987,27 @@ DEFAULT_CONFIG = {
         "backup_count": 3,     # Number of rotated backup files to keep
     },
 
+    # Remotely-hosted model catalog manifest.  When enabled, the CLI fetches
+    # curated model lists for OpenRouter and Nous Portal from this URL,
+    # falling back to the in-repo snapshot on network failure.  Lets us
+    # update model picker lists without shipping a hermes-agent release.
+    # The default URL is served by the docs site GitHub Pages deploy.
+    "model_catalog": {
+        "enabled": True,
+        "url": "https://hermes-agent.nousresearch.com/docs/api/model-catalog.json",
+        # Disk cache TTL in hours.  Beyond this, the CLI refetches on the
+        # next /model or `hermes model` invocation; network failures
+        # silently fall back to the stale cache.
+        "ttl_hours": 24,
+        # Optional per-provider override URLs for third parties that want
+        # to self-host their own curation list using the same schema.
+        # Example:
+        #   providers:
+        #     openrouter:
+        #       url: https://example.com/my-curation.json
+        "providers": {},
+    },
+
     # Network settings — workarounds for connectivity issues.
     "network": {
         # Force IPv4 connections.  On servers with broken or unreachable IPv6,
@@ -993,6 +1042,27 @@ DEFAULT_CONFIG = {
         # the sweep on every CLI invocation).  Tracked via state_meta in
         # state.db itself, so it's shared across all processes.
         "min_interval_hours": 24,
+    },
+
+    # Contextual first-touch onboarding hints (see agent/onboarding.py).
+    # Each hint is shown once per install and then latched here so it
+    # never fires again.  Users can wipe the section to re-see all hints.
+    "onboarding": {
+        "seen": {},
+    },
+
+    # ``hermes update`` behaviour.
+    "updates": {
+        # Run a full ``hermes backup``-style zip of HERMES_HOME before every
+        # ``hermes update``.  Backups land in ``<HERMES_HOME>/backups/`` and
+        # can be restored with ``hermes import <path>``.  Off by default —
+        # on large HERMES_HOME directories the zip can add minutes to every
+        # update.  Set to true to re-enable, or pass ``--backup`` to opt in
+        # for a single update run.
+        "pre_update_backup": False,
+        # How many pre-update backup zips to retain.  Older ones are pruned
+        # automatically after each successful backup.
+        "backup_keep": 5,
     },
 
     # Config schema version - bump this when adding new required fields
@@ -1179,6 +1249,22 @@ OPTIONAL_ENV_VARS = {
     "ARCEE_BASE_URL": {
         "description": "Arcee AI base URL override",
         "prompt": "Arcee base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "GMI_API_KEY": {
+        "description": "GMI Cloud API key",
+        "prompt": "GMI Cloud API key",
+        "url": "https://www.gmicloud.ai/",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "GMI_BASE_URL": {
+        "description": "GMI Cloud base URL override",
+        "prompt": "GMI Cloud base URL (leave empty for default)",
         "url": None,
         "password": False,
         "category": "provider",
@@ -1553,6 +1639,44 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
     },
 
+    # ── Bundled skills (opt-in: only needed if the user uses that skill) ──
+    # These use category="skill" (distinct from "tool") so the sandbox
+    # env blocklist in tools/environments/local.py does NOT rewrite them —
+    # skills legitimately need these passed through to curl via
+    # tools/env_passthrough.py when the user's skill calls out.
+    "NOTION_API_KEY": {
+        "description": "Notion integration token (used by the `notion` skill)",
+        "prompt": "Notion API key",
+        "url": "https://www.notion.so/my-integrations",
+        "password": True,
+        "category": "skill",
+        "advanced": True,
+    },
+    "LINEAR_API_KEY": {
+        "description": "Linear personal API key (used by the `linear` skill)",
+        "prompt": "Linear API key",
+        "url": "https://linear.app/settings/api",
+        "password": True,
+        "category": "skill",
+        "advanced": True,
+    },
+    "AIRTABLE_API_KEY": {
+        "description": "Airtable personal access token (used by the `airtable` skill)",
+        "prompt": "Airtable API key",
+        "url": "https://airtable.com/create/tokens",
+        "password": True,
+        "category": "skill",
+        "advanced": True,
+    },
+    "TENOR_API_KEY": {
+        "description": "Tenor API key for GIF search (used by the `gif-search` skill)",
+        "prompt": "Tenor API key",
+        "url": "https://developers.google.com/tenor/guides/quickstart",
+        "password": True,
+        "category": "skill",
+        "advanced": True,
+    },
+
     # ── Honcho ──
     "HONCHO_API_KEY": {
         "description": "Honcho API key for AI-native persistent memory",
@@ -1710,6 +1834,14 @@ OPTIONAL_ENV_VARS = {
     "MATRIX_AUTO_THREAD": {
         "description": "Auto-create threads for messages in Matrix rooms (default: true)",
         "prompt": "Auto-create threads in rooms (true/false)",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "MATRIX_DM_AUTO_THREAD": {
+        "description": "Auto-create threads for DM messages in Matrix (default: false)",
+        "prompt": "Auto-create threads in DMs (true/false)",
         "url": None,
         "password": False,
         "category": "messaging",
@@ -3229,14 +3361,16 @@ def load_config() -> Dict[str, Any]:
 
 _SECURITY_COMMENT = """
 # ── Security ──────────────────────────────────────────────────────────
-# API keys, tokens, and passwords are redacted from tool output by default.
-# Set to false to see full values (useful for debugging auth issues).
+# Secret redaction is OFF by default — tool output (terminal stdout,
+# read_file results, web content) passes through unmodified. Set
+# redact_secrets to true to mask strings that look like API keys, tokens,
+# and passwords before they enter the model context and logs.
 # tirith pre-exec scanning is enabled by default when the tirith binary
 # is available. Configure via security.tirith_* keys or env vars
 # (TIRITH_ENABLED, TIRITH_BIN, TIRITH_TIMEOUT, TIRITH_FAIL_OPEN).
 #
 # security:
-#   redact_secrets: false
+#   redact_secrets: true
 #   tirith_enabled: true
 #   tirith_path: "tirith"
 #   tirith_timeout: 5
@@ -3269,11 +3403,11 @@ _FALLBACK_COMMENT = """
 
 _COMMENTED_SECTIONS = """
 # ── Security ──────────────────────────────────────────────────────────
-# API keys, tokens, and passwords are redacted from tool output by default.
-# Set to false to see full values (useful for debugging auth issues).
+# Secret redaction is OFF by default. Set to true to mask strings that
+# look like API keys, tokens, and passwords in tool output and logs.
 #
 # security:
-#   redact_secrets: false
+#   redact_secrets: true
 
 # ── Fallback Model ────────────────────────────────────────────────────
 # Automatic provider failover when primary is unavailable.
