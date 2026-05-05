@@ -1650,6 +1650,42 @@ class TestCodexAdapterReasoningTranslation:
         )
         assert "reasoning" not in captured
 
+    def test_reasoning_effort_null_falls_back_to_medium(self):
+        """Parity with agent/transports/codex.py::build_kwargs() — falsy
+        ``effort`` (None / empty / 0) keeps the default ``medium`` instead
+        of being forwarded to Codex.  Codex rejects ``{"effort": null}``
+        with HTTP 400 (Invalid value for parameter `reasoning.effort`)."""
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": None}},
+        )
+        assert captured.get("reasoning") == {"effort": "medium", "summary": "auto"}
+        assert captured.get("include") == ["reasoning.encrypted_content"]
+
+    def test_reasoning_effort_empty_string_falls_back_to_medium(self):
+        """Empty-string effort (e.g. ``effort: ""`` in YAML) is falsy in
+        the main-agent path's truthy check; mirror that here so the same
+        config produces the same result."""
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": ""}},
+        )
+        assert captured.get("reasoning") == {"effort": "medium", "summary": "auto"}
+        assert captured.get("include") == ["reasoning.encrypted_content"]
+
+    def test_reasoning_effort_zero_falls_back_to_medium(self):
+        """Numeric ``0`` is also falsy — the docstring lists it explicitly,
+        so cover the contract.  Codex would reject ``{"effort": 0}`` the
+        same way it rejects ``null``."""
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": 0}},
+        )
+        assert captured.get("reasoning") == {"effort": "medium", "summary": "auto"}
+        assert captured.get("include") == ["reasoning.encrypted_content"]
 
 
 class TestVisionAutoSkipsKimiCoding:
@@ -1893,3 +1929,53 @@ class TestOpenRouterExplicitApiKey:
             assert call_kwargs["api_key"] == "env-fallback-key", (
                 f"Expected env fallback key to be used when explicit_api_key is None, got: {call_kwargs['api_key']}"
             )
+
+
+class TestAnthropicExplicitApiKey:
+    """Test that explicit_api_key is correctly propagated to _try_anthropic().
+
+    Parity with the OpenRouter fix in #18768: resolve_provider_client() passes
+    explicit_api_key to _try_openrouter(), but the anthropic branch was not
+    updated — _try_anthropic() always fell back to resolve_anthropic_token()
+    even when an explicit key was supplied (e.g. from a fallback_model entry).
+    """
+
+    def test_try_anthropic_uses_explicit_api_key_over_env(self):
+        """_try_anthropic(explicit_api_key) must use the supplied key, not the env fallback."""
+        with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="env-fallback-key"), \
+             patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
+             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+            mock_build.return_value = MagicMock()
+            from agent.auxiliary_client import _try_anthropic
+            client, model = _try_anthropic("explicit-pool-key")
+        assert client is not None
+        assert mock_build.call_args.args[0] == "explicit-pool-key", (
+            f"Expected explicit_api_key to be passed, got: {mock_build.call_args.args[0]}"
+        )
+        assert mock_build.call_args.args[0] != "env-fallback-key"
+
+    def test_try_anthropic_without_explicit_key_falls_back_to_resolve(self):
+        """Without explicit_api_key, _try_anthropic falls back to resolve_anthropic_token."""
+        with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="env-fallback-key"), \
+             patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
+             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+            mock_build.return_value = MagicMock()
+            from agent.auxiliary_client import _try_anthropic
+            client, model = _try_anthropic()
+        assert client is not None
+        assert mock_build.call_args.args[0] == "env-fallback-key"
+
+    def test_resolve_provider_client_passes_explicit_api_key_to_anthropic(self):
+        """resolve_provider_client(provider='anthropic', explicit_api_key=...) must propagate the key."""
+        with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="env-key"), \
+             patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
+             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+            mock_build.return_value = MagicMock()
+            client, model = resolve_provider_client(
+                provider="anthropic",
+                explicit_api_key="explicit-fallback-key",
+            )
+        assert client is not None
+        assert mock_build.call_args.args[0] == "explicit-fallback-key", (
+            "resolve_provider_client must forward explicit_api_key to _try_anthropic()"
+        )
