@@ -315,7 +315,15 @@ def _handle_block(args: dict, **kw) -> str:
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
-    """Signal that the worker is still alive during a long operation."""
+    """Signal that the worker is still alive during a long operation.
+
+    Extends the claim TTL via ``heartbeat_claim`` AND records a heartbeat
+    event via ``heartbeat_worker``. Without the ``heartbeat_claim`` half,
+    a diligent worker that loops this tool while a single tool call
+    blocks the agent for >DEFAULT_CLAIM_TTL_SECONDS still gets reclaimed
+    by ``release_stale_claims`` — which is exactly the trap that
+    ``heartbeat_claim``'s docstring warns against.
+    """
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -328,6 +336,14 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     try:
         kb, conn = _connect()
         try:
+            # Extend the claim TTL first. The dispatcher pins
+            # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
+            # (see _default_spawn in kanban_db.py); falling back to the
+            # default _claimer_id() covers locally-driven workers that
+            # never went through the dispatcher path.
+            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+
             ok = kb.heartbeat_worker(
                 conn,
                 tid,
@@ -357,7 +373,16 @@ def _handle_comment(args: dict, **kw) -> str:
     body = args.get("body")
     if not body or not str(body).strip():
         return tool_error("body is required")
-    author = args.get("author") or os.environ.get("HERMES_PROFILE") or "worker"
+    # Author is intentionally derived from the worker's own runtime
+    # identity, NOT from caller-supplied args. Comments are injected
+    # into the next worker's system prompt by ``build_worker_context``
+    # as ``**{author}** (timestamp): {body}`` — accepting an
+    # ``args["author"]`` override let a worker forge a comment from
+    # an authoritative-looking name like ``hermes-system`` and poison
+    # the future-worker context with what reads as a system directive.
+    # Cross-task commenting itself remains unrestricted (see #19713) —
+    # comments are the deliberate handoff channel between tasks.
+    author = os.environ.get("HERMES_PROFILE") or "worker"
     try:
         kb, conn = _connect()
         try:
@@ -639,13 +664,6 @@ KANBAN_COMMENT_SCHEMA = {
             "body": {
                 "type": "string",
                 "description": "Markdown-supported comment body.",
-            },
-            "author": {
-                "type": "string",
-                "description": (
-                    "Override author name. Defaults to the current "
-                    "profile (HERMES_PROFILE env)."
-                ),
             },
         },
         "required": ["task_id", "body"],
