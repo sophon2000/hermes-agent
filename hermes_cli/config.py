@@ -28,6 +28,48 @@ from typing import Dict, Any, Optional, List, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Track which (config_path, mtime_ns, size) tuples we've already warned about
+# so concurrent CLI/gateway loads of a broken config.yaml don't spam stderr
+# every time. Cleared automatically when the file changes (different mtime).
+_CONFIG_PARSE_WARNED: set = set()
+
+
+def _warn_config_parse_failure(config_path: Path, exc: Exception) -> None:
+    """Surface a config.yaml parse failure to user, log, and stderr.
+
+    A YAML parse error in ``~/.hermes/config.yaml`` causes ``load_config()``
+    to silently fall back to ``DEFAULT_CONFIG``, which means every user
+    override (auxiliary providers, fallback chain, model overrides, etc.)
+    is dropped. Before this helper that was a one-line ``print(...)`` that
+    scrolled off-screen on the first invocation and was never seen again.
+
+    Now: warn once per (path, mtime_ns, size) on stderr **and** in
+    ``agent.log`` / ``errors.log`` at WARNING level so ``hermes logs``
+    surfaces it. Re-warns automatically if the file changes (different
+    mtime/size), so users editing the config see the next failure.
+    """
+    try:
+        st = config_path.stat()
+        key = (str(config_path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (str(config_path), 0, 0)
+    if key in _CONFIG_PARSE_WARNED:
+        return
+    _CONFIG_PARSE_WARNED.add(key)
+
+    msg = (
+        f"Failed to parse {config_path}: {exc}. "
+        f"Falling back to default config — every user override "
+        f"(auxiliary providers, fallback chain, model settings) is being IGNORED. "
+        f"Fix the YAML and restart."
+    )
+    logger.warning(msg)
+    try:
+        sys.stderr.write(f"⚠️  hermes config: {msg}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
 _IS_WINDOWS = platform.system() == "Windows"
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
@@ -537,6 +579,7 @@ DEFAULT_CONFIG = {
         # Explicit opt-in: mount the host cwd into /workspace for Docker sessions.
         # Default off because passing host directories into a sandbox weakens isolation.
         "docker_mount_cwd_to_workspace": False,
+        "docker_extra_args": [],        # Extra flags passed verbatim to docker run
         # Explicit opt-in: run the Docker container as the host user's uid:gid
         # (via `--user`).  When enabled, files written into bind-mounted dirs
         # (docker_volumes, the persistent workspace, or the auto-mounted cwd)
@@ -691,9 +734,18 @@ DEFAULT_CONFIG = {
     #   See: https://openrouter.ai/docs/guides/features/response-caching
     # response_cache_ttl: how long cached responses remain valid, in seconds (1-86400).
     #   Default 300 (5 minutes). Only used when response_cache is enabled.
+    # min_coding_score: knob for the openrouter/pareto-code router (0.0-1.0).
+    #   Only applied when model.model is "openrouter/pareto-code". Higher
+    #   values route to stronger (more expensive) coders; lower values open
+    #   up cheaper, faster options. Default 0.65 lands on the mid-tier
+    #   coder on the current Pareto frontier. Empty string = let OpenRouter
+    #   pick the strongest available coder (router's documented default
+    #   when the plugins block is omitted).
+    #   See: https://openrouter.ai/docs/guides/routing/routers/pareto-router
     "openrouter": {
         "response_cache": True,
         "response_cache_ttl": 300,
+        "min_coding_score": 0.65,
     },
 
     # AWS Bedrock provider configuration.
@@ -722,6 +774,26 @@ DEFAULT_CONFIG = {
     # Empty model = use provider's default auxiliary model.
     # All tasks fall back to openrouter:google/gemini-3-flash-preview if
     # the configured provider is unavailable.
+    #
+    # extra_body: forwarded verbatim as request body fields on every aux call
+    # for that task. Use this to set provider-specific knobs (independent of
+    # main-agent settings). On OpenRouter you can set provider routing prefs
+    # and the Pareto Code coding-score floor here. Example:
+    #
+    #   auxiliary:
+    #     compression:
+    #       provider: openrouter
+    #       model: openrouter/pareto-code
+    #       extra_body:
+    #         provider:           # OpenRouter provider routing
+    #           order: [anthropic, google]
+    #           sort: throughput  # or price | latency
+    #         plugins:            # OpenRouter Pareto Code router
+    #           - id: pareto-router
+    #             min_coding_score: 0.5
+    #
+    # Each aux task is independent — main-agent provider_routing and
+    # openrouter.min_coding_score do NOT propagate to aux calls by design.
     "auxiliary": {
         "vision": {
             "provider": "auto",    # auto | openrouter | nous | codex | custom
@@ -830,6 +902,7 @@ DEFAULT_CONFIG = {
         "bell_on_complete": False,
         "show_reasoning": False,
         "streaming": False,
+        "timestamps": False,      # Show [HH:MM] on user and assistant labels
         "final_response_markdown": "strip",  # render | strip | raw
         # Preserve recent classic CLI output across Ctrl+L, /redraw, and
         # terminal resize full-screen clears. Disable if a terminal emulator
@@ -1204,6 +1277,15 @@ DEFAULT_CONFIG = {
         # "Always Approve" to silence the prompt permanently; that flips
         # this key to false.
         "mcp_reload_confirm": True,
+        # When true, destructive session slash commands (/clear, /new, /reset,
+        # /undo) ask the user to confirm before discarding conversation state.
+        # Three-option prompt (Approve Once / Always Approve / Cancel) routed
+        # through tools.slash_confirm — native yes/no buttons on Telegram,
+        # Discord, and Slack; text fallback elsewhere.  Users click "Always
+        # Approve" to silence the prompt permanently; that flips this key to
+        # false.  TUI has its own modal overlay (HERMES_TUI_NO_CONFIRM=1 to
+        # opt out there).
+        "destructive_slash_confirm": True,
     },
 
     # Permanently allowed dangerous command patterns (added via "always" approval)
@@ -3966,7 +4048,8 @@ def read_raw_config() -> Dict[str, Any]:
         try:
             with open(config_path, encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
-        except Exception:
+        except Exception as e:
+            _warn_config_parse_failure(config_path, e)
             return {}
 
         if not isinstance(data, dict):
@@ -4016,7 +4099,7 @@ def load_config() -> Dict[str, Any]:
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
-                print(f"Warning: Failed to load config: {e}")
+                _warn_config_parse_failure(config_path, e)
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         expanded = _expand_env_vars(normalized)
@@ -4805,6 +4888,7 @@ def set_config_value(key: str, value: str):
         "terminal.vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
         "terminal.docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
         "terminal.docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
+        "terminal.docker_env": "TERMINAL_DOCKER_ENV",
         # terminal.cwd intentionally excluded — CLI resolves at runtime,
         # gateway bridges it in gateway/run.py. Persisting to .env causes
         # stale values to poison child processes.
